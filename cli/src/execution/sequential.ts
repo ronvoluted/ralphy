@@ -7,6 +7,7 @@ import type { Task, TaskSource } from "../tasks/types.ts";
 import { logDebug, logError, logInfo, logSuccess, logWarn } from "../ui/logger.ts";
 import { notifyTaskComplete, notifyTaskFailed } from "../ui/notify.ts";
 import { ProgressSpinner } from "../ui/spinner.ts";
+import { StreamRenderer } from "../ui/stream.ts";
 import { clearDeferredTask, recordDeferredTask } from "./deferred.ts";
 import { buildPrompt } from "./prompt.ts";
 import { isFatalError, isRetryableError, sleep, withRetry } from "./retry.ts";
@@ -40,6 +41,8 @@ export interface ExecutionOptions {
 	engineArgs?: string[];
 	/** GitHub issue number to sync PRD with on each iteration */
 	syncIssue?: number;
+	/** Stream raw AI output to stdout */
+	streamOutput?: boolean;
 }
 
 export interface ExecutionResult {
@@ -73,6 +76,7 @@ export async function runSequential(options: ExecutionOptions): Promise<Executio
 		modelOverride,
 		engineArgs,
 		syncIssue,
+		streamOutput,
 	} = options;
 
 	const result: ExecutionResult = {
@@ -125,8 +129,10 @@ export async function runSequential(options: ExecutionOptions): Promise<Executio
 			prdFile: options.prdFile,
 		});
 
-		// Execute with spinner
+		// Execute with spinner and optional stream renderer
 		const spinner = new ProgressSpinner(task.title, activeSettings);
+		const stream = streamOutput ? new StreamRenderer(spinner) : null;
+		const showError = (msg: string) => (stream ? stream.error(msg) : spinner.error(msg));
 		let aiResult: AIResult | null = null;
 
 		if (dryRun) {
@@ -150,6 +156,7 @@ export async function runSequential(options: ExecutionOptions): Promise<Executio
 									spinner.updateStep(step);
 								},
 								engineOptions,
+								stream ? (text) => stream.write(text) : undefined,
 							);
 						}
 
@@ -171,7 +178,11 @@ export async function runSequential(options: ExecutionOptions): Promise<Executio
 				);
 
 				if (aiResult.success) {
-					spinner.success(undefined, true); // Show timing breakdown
+					if (stream) {
+						stream.success();
+					} else {
+						spinner.success(undefined, true); // Show timing breakdown
+					}
 					result.totalInputTokens += aiResult.inputTokens;
 					result.totalOutputTokens += aiResult.outputTokens;
 
@@ -207,7 +218,7 @@ export async function runSequential(options: ExecutionOptions): Promise<Executio
 					const errMsg = aiResult.error || "Unknown error";
 					if (isRetryableError(errMsg)) {
 						const deferrals = recordDeferredTask(taskSource.type, task, workDir, options.prdFile);
-						spinner.error(errMsg);
+						showError(errMsg);
 						if (deferrals >= maxRetries) {
 							logError(`Task "${task.title}" failed after ${deferrals} deferrals: ${errMsg}`);
 							logTaskProgress(task.title, "failed", workDir);
@@ -222,14 +233,14 @@ export async function runSequential(options: ExecutionOptions): Promise<Executio
 						}
 					} else if (isFatalError(errMsg)) {
 						// Fatal error (auth, config) - abort all remaining tasks
-						spinner.error(errMsg);
+						showError(errMsg);
 						logError(`Fatal error: ${errMsg}`);
 						logError("Aborting remaining tasks due to configuration/authentication issue.");
 						result.tasksFailed++;
 						notifyTaskFailed(task.title, errMsg);
 						return result; // Exit immediately
 					} else {
-						spinner.error(errMsg);
+						showError(errMsg);
 						logTaskProgress(task.title, "failed", workDir);
 						result.tasksFailed++;
 						notifyTaskFailed(task.title, errMsg);
@@ -242,7 +253,7 @@ export async function runSequential(options: ExecutionOptions): Promise<Executio
 				const errorMsg = error instanceof Error ? error.message : String(error);
 				if (isRetryableError(errorMsg)) {
 					const deferrals = recordDeferredTask(taskSource.type, task, workDir, options.prdFile);
-					spinner.error(errorMsg);
+					showError(errorMsg);
 					if (deferrals >= maxRetries) {
 						logError(`Task "${task.title}" failed after ${deferrals} deferrals: ${errorMsg}`);
 						logTaskProgress(task.title, "failed", workDir);
@@ -257,14 +268,14 @@ export async function runSequential(options: ExecutionOptions): Promise<Executio
 					}
 				} else if (isFatalError(errorMsg)) {
 					// Fatal error (auth, config) - abort all remaining tasks
-					spinner.error(errorMsg);
+					showError(errorMsg);
 					logError(`Fatal error: ${errorMsg}`);
 					logError("Aborting remaining tasks due to configuration/authentication issue.");
 					result.tasksFailed++;
 					notifyTaskFailed(task.title, errorMsg);
 					return result; // Exit immediately
 				} else {
-					spinner.error(errorMsg);
+					showError(errorMsg);
 					logTaskProgress(task.title, "failed", workDir);
 					result.tasksFailed++;
 					notifyTaskFailed(task.title, errorMsg);
